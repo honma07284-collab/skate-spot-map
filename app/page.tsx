@@ -404,9 +404,19 @@ export default function Home() {
           lat: spot.lat,
         });
         if (insertError) throw insertError;
-      } catch {
+      } catch (saveError) {
         if (photoPath) await supabase.storage.from("spot-photos").remove([photoPath]);
-        setFormError("写真を保存できませんでした。別の写真でもう一度お試しください");
+        const message = saveError instanceof Error ? saveError.message : "";
+        const code = typeof saveError === "object" && saveError && "code" in saveError
+          ? String(saveError.code)
+          : "";
+        if (code === "PGRST205" || message.includes("Could not find the table")) {
+          setFormError("Supabaseの初期設定が未完了です。SQL Editorでsupabase/schema.sqlを実行してから再試行してください。");
+        } else if (photoPath) {
+          setFormError(`写真を保存できませんでした。${message}`);
+        } else {
+          setFormError(`スポットを保存できませんでした。${message || "もう一度お試しください"}`);
+        }
         setIsSavingPhoto(false);
         return;
       }

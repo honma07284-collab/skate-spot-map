@@ -62,6 +62,16 @@ create trigger create_profile_after_signup
 after insert on auth.users
 for each row execute procedure public.create_profile_for_new_user();
 
+insert into public.profiles (id, username, avatar)
+select distinct on (lower(raw_user_meta_data ->> 'username'))
+  id,
+  lower(raw_user_meta_data ->> 'username'),
+  coalesce(raw_user_meta_data ->> 'avatar', '🛹')
+from auth.users
+where raw_user_meta_data ->> 'username' ~ '^[a-z0-9_]{3,20}$'
+order by lower(raw_user_meta_data ->> 'username'), created_at, id
+on conflict do nothing;
+
 create or replace function public.send_friend_request(target_username text)
 returns uuid
 language plpgsql
