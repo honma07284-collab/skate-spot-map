@@ -7,6 +7,7 @@ import {
   Camera,
   ChevronDown,
   ChevronUp,
+  CircleUserRound,
   Crosshair,
   MapPin,
   MapPinned,
@@ -14,6 +15,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import type { User } from "@supabase/supabase-js";
 import {
   AttributionControl,
   Map,
@@ -23,7 +25,9 @@ import {
   type MapMouseEvent,
 } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import AccountPanel from "./account-panel";
 import { deleteSpotPhoto, getSpotPhoto, saveSpotPhoto } from "./photo-store";
+import { CloudSpot, Profile, supabase } from "./supabase";
 
 const SPOTS_STORAGE_KEY = "skate-spot-map:spots";
 const SPOT_TYPES = ["レール", "カーブ", "フラット", "バンク"] as const;
@@ -35,6 +39,10 @@ type Spot = {
   note: string;
   types: SpotType[];
   hasPhoto?: boolean;
+  photoPath?: string | null;
+  ownerId?: string;
+  ownerUsername?: string;
+  ownerAvatar?: string;
   lng: number;
   lat: number;
 };
@@ -70,26 +78,32 @@ async function optimizePhoto(file: File): Promise<Blob> {
   }
 }
 
-function SavedSpotPhoto({ spotId }: { spotId: string }) {
+function SavedSpotPhoto({ spotId, photoPath }: { spotId: string; photoPath?: string | null }) {
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     let objectUrl: string | null = null;
 
-    getSpotPhoto(spotId)
-      .then((photo) => {
-        if (!photo || cancelled) return;
-        objectUrl = URL.createObjectURL(photo);
-        setPhotoUrl(objectUrl);
-      })
-      .catch(() => undefined);
+    const loadPhoto = async () => {
+      if (photoPath && supabase) {
+        const { data, error } = await supabase.storage.from("spot-photos").createSignedUrl(photoPath, 60);
+        if (error || !data || cancelled) return;
+        setPhotoUrl(data.signedUrl);
+        return;
+      }
+      const photo = await getSpotPhoto(spotId);
+      if (!photo || cancelled) return;
+      objectUrl = URL.createObjectURL(photo);
+      setPhotoUrl(objectUrl);
+    };
+    loadPhoto().catch(() => undefined);
 
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [spotId]);
+  }, [photoPath, spotId]);
 
   if (!photoUrl) return null;
   return (
@@ -112,8 +126,12 @@ export default function Home() {
   const draftPhotoUrlRef = useRef<string | null>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
   const [mapReady, setMapReady] = useState(false);
-  const [spots, setSpots] = useState<Spot[]>([]);
+  const [cloudSpots, setCloudSpots] = useState<Spot[]>([]);
+  const [localSpots, setLocalSpots] = useState<Spot[]>([]);
   const [storageReady, setStorageReady] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [accountOpen, setAccountOpen] = useState(false);
   const [draftLocation, setDraftLocation] = useState<DraftLocation | null>(null);
   const [draftName, setDraftName] = useState("");
   const [draftNote, setDraftNote] = useState("");
@@ -125,6 +143,8 @@ export default function Home() {
   const [activeFilter, setActiveFilter] = useState<SpotType | "すべて">("すべて");
   const [panelExpanded, setPanelExpanded] = useState(false);
 
+  const spots = user ? cloudSpots : localSpots;
+  const activeProfile = profile?.id === user?.id ? profile : null;
   const visibleSpots = useMemo(
     () =>
       activeFilter === "すべて"
@@ -142,7 +162,10 @@ export default function Home() {
     const timeoutId = window.setTimeout(() => {
       try {
         const storedSpots = window.localStorage.getItem(SPOTS_STORAGE_KEY);
-        if (storedSpots) setSpots(JSON.parse(storedSpots) as Spot[]);
+        if (storedSpots) {
+          const parsedSpots = JSON.parse(storedSpots) as Spot[];
+          setLocalSpots(parsedSpots);
+        }
       } catch {
         window.localStorage.removeItem(SPOTS_STORAGE_KEY);
       }
@@ -152,9 +175,67 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!storageReady) return;
+    if (!supabase) return;
+    let cancelled = false;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!cancelled) setUser(data.session?.user ?? null);
+    });
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => {
+      cancelled = true;
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady || !user || !supabase) return;
+
+    let cancelled = false;
+    async function loadCloudData() {
+      const [profileResult, spotsResult] = await Promise.all([
+        supabase!.from("profiles").select("id,username,avatar").eq("id", user!.id).single(),
+        supabase!.from("spots").select("id,owner_id,name,note,types,has_photo,photo_path,lng,lat,created_at").order("created_at", { ascending: false }),
+      ]);
+      if (profileResult.error) throw profileResult.error;
+      if (spotsResult.error) throw spotsResult.error;
+
+      const cloudSpots = (spotsResult.data ?? []) as (CloudSpot & { created_at: string })[];
+      const ownerIds = [...new Set(cloudSpots.map((spot) => spot.owner_id))];
+      const ownersResult = ownerIds.length
+        ? await supabase!.from("profiles").select("id,username,avatar").in("id", ownerIds)
+        : { data: [], error: null };
+      if (ownersResult.error) throw ownersResult.error;
+      const owners = new globalThis.Map(((ownersResult.data ?? []) as Profile[]).map((owner) => [owner.id, owner]));
+      if (cancelled) return;
+
+      setProfile(profileResult.data as Profile);
+      setCloudSpots(cloudSpots.map((spot) => ({
+        id: spot.id,
+        name: spot.name,
+        note: spot.note,
+        types: spot.types as SpotType[],
+        hasPhoto: spot.has_photo,
+        photoPath: spot.photo_path,
+        ownerId: spot.owner_id,
+        ownerUsername: owners.get(spot.owner_id)?.username,
+        ownerAvatar: owners.get(spot.owner_id)?.avatar,
+        lng: spot.lng,
+        lat: spot.lat,
+      })));
+    }
+
+    loadCloudData().catch(() => {
+      if (!cancelled) setCloudSpots([]);
+    });
+    return () => { cancelled = true; };
+  }, [storageReady, user]);
+
+  useEffect(() => {
+    if (!storageReady || user) return;
     window.localStorage.setItem(SPOTS_STORAGE_KEY, JSON.stringify(spots));
-  }, [spots, storageReady]);
+  }, [spots, storageReady, user]);
 
   useEffect(() => {
     if (!mapContainer.current) return;
@@ -300,7 +381,42 @@ export default function Home() {
       ...draftLocation,
     };
 
-    if (draftPhoto) {
+    if (user && supabase) {
+      setIsSavingPhoto(true);
+      let photoPath: string | null = null;
+      try {
+        if (draftPhoto) {
+          photoPath = `${user.id}/${spot.id}/photo.jpg`;
+          const { error: uploadError } = await supabase.storage
+            .from("spot-photos")
+            .upload(photoPath, await optimizePhoto(draftPhoto.file), { contentType: "image/jpeg" });
+          if (uploadError) throw uploadError;
+        }
+        const { error: insertError } = await supabase.from("spots").insert({
+          id: spot.id,
+          owner_id: user.id,
+          name: spot.name,
+          note: spot.note,
+          types: spot.types,
+          has_photo: Boolean(photoPath),
+          photo_path: photoPath,
+          lng: spot.lng,
+          lat: spot.lat,
+        });
+        if (insertError) throw insertError;
+      } catch {
+        if (photoPath) await supabase.storage.from("spot-photos").remove([photoPath]);
+        setFormError("写真を保存できませんでした。別の写真でもう一度お試しください");
+        setIsSavingPhoto(false);
+        return;
+      }
+      setIsSavingPhoto(false);
+      spot.hasPhoto = Boolean(photoPath);
+      spot.photoPath = photoPath;
+      spot.ownerId = user.id;
+      spot.ownerUsername = activeProfile?.username;
+      spot.ownerAvatar = activeProfile?.avatar;
+    } else if (draftPhoto) {
       setIsSavingPhoto(true);
       try {
         await saveSpotPhoto(spot.id, await optimizePhoto(draftPhoto.file));
@@ -312,7 +428,8 @@ export default function Home() {
       setIsSavingPhoto(false);
     }
 
-    setSpots((current) => [spot, ...current]);
+    if (user && supabase) setCloudSpots((current) => [spot, ...current]);
+    else setLocalSpots((current) => [spot, ...current]);
     setActiveFilter("すべて");
     setDraftLocation(null);
     setDraftName("");
@@ -324,9 +441,19 @@ export default function Home() {
     setPanelExpanded(true);
   }
 
-  function deleteSpot(spotId: string) {
-    void deleteSpotPhoto(spotId).catch(() => undefined);
-    setSpots((current) => current.filter((spot) => spot.id !== spotId));
+  async function deleteSpot(spot: Spot) {
+    if (spot.ownerId && supabase) {
+      const { error: deleteError } = await supabase.from("spots").delete().eq("id", spot.id);
+      if (deleteError) {
+        setFormError("スポットを削除できませんでした");
+        return;
+      }
+      if (spot.photoPath) await supabase.storage.from("spot-photos").remove([spot.photoPath]);
+    } else {
+      void deleteSpotPhoto(spot.id).catch(() => undefined);
+    }
+    if (spot.ownerId && user) setCloudSpots((current) => current.filter((currentSpot) => currentSpot.id !== spot.id));
+    else setLocalSpots((current) => current.filter((currentSpot) => currentSpot.id !== spot.id));
     setSelectedSpotId(null);
   }
 
@@ -366,6 +493,67 @@ export default function Home() {
     });
   }
 
+  async function importLocalSpots() {
+    if (!user || !supabase) throw new Error("ログインしてから移行してください");
+    const importedSpots: Spot[] = [];
+
+    for (const localSpot of localSpots) {
+      const { data: existing, error: lookupError } = await supabase
+        .from("spots")
+        .select("id")
+        .eq("owner_id", user.id)
+        .eq("source_id", localSpot.id)
+        .maybeSingle();
+      if (lookupError) throw lookupError;
+      if (existing) continue;
+
+      const newId = createSpotId();
+      let photoPath: string | null = null;
+      let hasPhoto = false;
+      const localPhoto = localSpot.hasPhoto ? await getSpotPhoto(localSpot.id) : null;
+      if (localPhoto) {
+        photoPath = `${user.id}/${newId}/photo.jpg`;
+        const { error: uploadError } = await supabase.storage
+          .from("spot-photos")
+          .upload(photoPath, localPhoto, { contentType: "image/jpeg" });
+        if (uploadError) throw uploadError;
+        hasPhoto = true;
+      }
+
+      const { data: inserted, error: insertError } = await supabase
+        .from("spots")
+        .insert({
+          id: newId,
+          owner_id: user.id,
+          source_id: localSpot.id,
+          name: localSpot.name,
+          note: localSpot.note,
+          types: localSpot.types,
+          has_photo: hasPhoto,
+          photo_path: photoPath,
+          lng: localSpot.lng,
+          lat: localSpot.lat,
+        })
+        .select("id")
+        .single();
+      if (insertError) {
+        if (photoPath) await supabase.storage.from("spot-photos").remove([photoPath]);
+        throw insertError;
+      }
+      importedSpots.push({
+        ...localSpot,
+        id: inserted.id,
+        hasPhoto,
+        photoPath,
+        ownerId: user.id,
+        ownerUsername: activeProfile?.username,
+        ownerAvatar: activeProfile?.avatar,
+      });
+    }
+
+    if (importedSpots.length) setCloudSpots((current) => [...importedSpots, ...current]);
+  }
+
   return (
     <main className="map-app">
       <div ref={mapContainer} className="map-canvas" aria-label="スケートスポット地図" />
@@ -382,6 +570,10 @@ export default function Home() {
             <h1>ROLL CALL</h1>
           </div>
           <span className="spot-count"><strong>{spots.length}</strong><span>SPOTS</span></span>
+          <button className="account-trigger" type="button" onClick={() => setAccountOpen(true)} aria-label={user ? "アカウントを開く" : "ログインまたは新規登録"}>
+            <span>{activeProfile?.avatar ?? <CircleUserRound size={18} />}</span>
+            <span>{activeProfile?.username ? `@${activeProfile.username}` : "ログイン"}</span>
+          </button>
           <button
             className="panel-toggle"
             type="button"
@@ -484,17 +676,20 @@ export default function Home() {
             </button>
             <div className="detail-topline">
               <span className="section-index">SPOT / {String(spots.indexOf(selectedSpot) + 1).padStart(2, "0")}</span>
-              <button className="icon-button delete-button" type="button" onClick={() => deleteSpot(selectedSpot.id)} aria-label="スポットを削除" title="スポットを削除">
-                <Trash2 size={17} />
-              </button>
+              {(!selectedSpot.ownerId || selectedSpot.ownerId === user?.id) && (
+                <button className="icon-button delete-button" type="button" onClick={() => void deleteSpot(selectedSpot)} aria-label="スポットを削除" title="スポットを削除">
+                  <Trash2 size={17} />
+                </button>
+              )}
             </div>
             <h2 className="detail-title">{selectedSpot.name}</h2>
+            {selectedSpot.ownerUsername && <p className="spot-owner"><span>{selectedSpot.ownerAvatar ?? "🛹"}</span>@{selectedSpot.ownerUsername} のスポット</p>}
             {selectedSpot.types.length > 0 ? (
               <div className="detail-types">
                 {selectedSpot.types.map((type) => <span className="detail-type" key={type}>{type}</span>)}
               </div>
             ) : <p className="detail-note is-empty">セクション未設定</p>}
-            {selectedSpot.hasPhoto && <SavedSpotPhoto key={selectedSpot.id} spotId={selectedSpot.id} />}
+            {selectedSpot.hasPhoto && <SavedSpotPhoto key={selectedSpot.id} spotId={selectedSpot.id} photoPath={selectedSpot.photoPath} />}
             {selectedSpot.note ? <p className="detail-note">{selectedSpot.note}</p> : <p className="detail-note is-empty">メモはまだありません</p>}
             <div className="coordinates"><MapPin size={15} /> {selectedSpot.lat.toFixed(5)}, {selectedSpot.lng.toFixed(5)}</div>
           </section>
@@ -547,7 +742,7 @@ export default function Home() {
               )}
             </section>
             <footer className="panel-footer">
-              <span className="local-indicator" />このブラウザに保存中
+              <span className="local-indicator" />{user ? "アカウントに同期中" : "このブラウザに保存中"}
               <span className="footer-mark">R / C</span>
             </footer>
           </>
@@ -564,6 +759,15 @@ export default function Home() {
           <span><Plus size={15} /></span><span className="map-prompt__desktop">地図をクリックしてスポットを追加</span><span className="map-prompt__mobile">スポットを追加</span>
         </button>
       )}
+      <AccountPanel
+        open={accountOpen}
+        user={user}
+        profile={activeProfile}
+        localSpotCount={localSpots.length}
+        onClose={() => setAccountOpen(false)}
+        onProfileChange={setProfile}
+        onImportLocal={importLocalSpots}
+      />
     </main>
   );
 }
